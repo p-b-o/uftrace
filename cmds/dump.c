@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <inttypes.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -863,6 +864,16 @@ static void dump_chrome_header(struct uftrace_dump_ops *ops, struct uftrace_data
 
 void print_json_escaped_char(char **args, size_t *len, const char c);
 
+static struct uftrace_time_range chrome_range;
+static struct uftrace_record chrome_stack[2048];
+static int chrome_stack_depth;
+enum TIME_RANGE_STATE {
+	TIME_RANGE_BEFORE,
+	TIME_RANGE_DURING,
+	TIME_RANGE_AFTER,
+};
+static enum TIME_RANGE_STATE chrome_state = TIME_RANGE_BEFORE;
+
 static void dump_chrome_task_rstack(struct uftrace_dump_ops *ops, struct uftrace_task_reader *task,
 				    char *name)
 {
@@ -881,6 +892,65 @@ static void dump_chrome_task_rstack(struct uftrace_dump_ops *ops, struct uftrace
 	struct uftrace_dbg_loc *loc = NULL;
 	uint64_t timestamp;
 	static uint64_t utc_offset_ns = 0;
+	bool in_time_range = check_time_range(&chrome_range, frs->time);
+
+	if (chrome_state == TIME_RANGE_AFTER) {
+		/* we're done */
+		return;
+	}
+
+	/* synchronize stack */
+	if (frs->type == UFTRACE_ENTRY) {
+		chrome_stack_depth = frs->depth - 1;
+		assert(frs->depth < 2048);
+		chrome_stack[frs->depth] = *frs;
+	}
+	else if (frs->type == UFTRACE_EXIT) {
+		chrome_stack_depth = frs->depth + 1;
+	}
+
+	if (!in_time_range && chrome_state == TIME_RANGE_BEFORE) {
+		return;
+	}
+
+	if (!in_time_range && chrome_state == TIME_RANGE_DURING) {
+		/* we just left time range, exit current stack */
+		struct uftrace_record *bak = task->rstack;
+		int current_depth = chrome_stack_depth;
+		for (int i = current_depth; i >= 1; --i) {
+			struct uftrace_record curr = chrome_stack[i];
+			struct uftrace_session_link *sessions = &task->h->sessions;
+			struct uftrace_symbol *sym = task_find_sym(sessions, task, &curr);
+			char *curr_name = symbol_getname(sym, curr.addr);
+			task->rstack = &curr;
+			curr.type = UFTRACE_EXIT;
+			curr.time = chrome_range.stop;
+			dump_chrome_task_rstack(ops, task, curr_name);
+			symbol_putname(sym, curr_name);
+		}
+		task->rstack = bak;
+		chrome_state = TIME_RANGE_AFTER;
+		return;
+	}
+
+	assert(in_time_range);
+	if (chrome_state == TIME_RANGE_BEFORE) {
+		/* enter current stack */
+		struct uftrace_record *bak = task->rstack;
+		int current_depth = chrome_stack_depth;
+		chrome_state = TIME_RANGE_DURING;
+		for (int i = 1; i <= current_depth; ++i) {
+			struct uftrace_record curr = chrome_stack[i];
+			struct uftrace_session_link *sessions = &task->h->sessions;
+			struct uftrace_symbol *sym = task_find_sym(sessions, task, &curr);
+			char *curr_name = symbol_getname(sym, curr.addr);
+			task->rstack = &curr;
+			curr.time = chrome_range.start;
+			dump_chrome_task_rstack(ops, task, curr_name);
+			symbol_putname(sym, curr_name);
+		}
+		task->rstack = bak;
+	}
 
 	/* Initialize the UTC offset */
 	if (utc_offset_ns == 0 && task->h->info.utc_offset) {
@@ -1685,6 +1755,9 @@ static void do_dump_replay(struct uftrace_dump_ops *ops, struct uftrace_opts *op
 	uint64_t prev_time = 0;
 	struct uftrace_task_reader *task;
 	int i;
+
+	chrome_range = handle->time_range;
+	memset(&handle->time_range, 0, sizeof(struct uftrace_time_range));
 
 	ops->header(ops, handle, opts);
 
