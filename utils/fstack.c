@@ -1921,8 +1921,25 @@ static void fstack_account_time(struct uftrace_task_reader *task)
 	if (!task->fstack_set) {
 		/* inherit stack count after [v]fork() or recover from lost */
 		task->stack_count = rstack->depth;
-		if (rstack->type == UFTRACE_EXIT)
+		if (rstack->type == UFTRACE_EXIT) {
 			task->stack_count++;
+
+			/*
+			 * Some tracers (e.g. the QEMU plugin) record EXIT with
+			 * depth = ENTRY_depth - 1 because they decrement the
+			 * depth counter before writing the EXIT record, whereas
+			 * mcount-based instrumentation uses the same depth for
+			 * both ENTRY and EXIT.
+			 *
+			 * TODO: a fix for the QEMU plugin has been submitted
+			 * (https://lore.kernel.org/qemu-devel/20260313063441.2048882-1-pierrick.bouvier@linaro.org/)
+			 * but until it is merged and widely adopted, keep this
+			 * heuristic to handle existing recorded data.
+			 */
+			if (task->func_stack && task->stack_count < task->h->hdr.max_stack &&
+			    task->func_stack[task->stack_count].addr == rstack->addr)
+				task->stack_count++;
+		}
 
 		task->fstack_set = true;
 
