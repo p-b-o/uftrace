@@ -1903,6 +1903,53 @@ static bool convert_perf_event(struct uftrace_task_reader *task, struct uftrace_
 	}
 }
 
+/*
+ * apply_existing_fstack_filter - reconstruct filter state for pre-range frames
+ *
+ * When time_range.start is set, ENTRY records before the range are skipped so
+ * fstack_entry() is never called for them.  This function mirrors what
+ * fstack_entry() would have done: it walks the pre-range frames whose
+ * addresses were saved by get_task_ustack() and updates in_count / out_count
+ * and the per-frame FSTACK_FL_* flags so that filters like -F work correctly
+ * for functions called within the time range.
+ */
+static void apply_existing_fstack_filter(struct uftrace_task_reader *task,
+					 struct uftrace_record *rstack)
+{
+	struct uftrace_session_link *sessions = &task->h->sessions;
+	struct uftrace_fstack *fstack;
+	struct uftrace_session *sess;
+	int i;
+
+	sess = find_task_session(sessions, task->t, rstack->time);
+	if (!sess)
+		return;
+
+	for (i = 0; i < task->stack_count; i++) {
+		struct uftrace_trigger tr = {};
+
+		fstack = fstack_get(task, i);
+		if (fstack == NULL || fstack->addr == 0)
+			continue;
+
+		uftrace_match_filter(fstack->addr, &sess->filter_info, &tr);
+
+		if (tr.flags & TRIGGER_FL_FILTER) {
+			if (tr.fmode == FILTER_MODE_IN) {
+				task->filter.in_count++;
+				fstack->flags |= FSTACK_FL_FILTERED;
+			}
+			else {
+				task->filter.out_count++;
+				fstack->flags |= FSTACK_FL_NOTRACE | FSTACK_FL_NORECORD;
+			}
+		}
+		else if (fstack_get_filter_mode() == FILTER_MODE_IN && task->filter.in_count == 0) {
+			fstack->flags |= FSTACK_FL_NORECORD;
+		}
+	}
+}
+
 static void fstack_account_time(struct uftrace_task_reader *task)
 {
 	struct uftrace_fstack *fstack;
@@ -1990,39 +2037,8 @@ static void fstack_account_time(struct uftrace_task_reader *task)
 		 * in_count / out_count state so that filters like -F work
 		 * correctly for functions called within the time range.
 		 */
-		if (task->func_stack) {
-			struct uftrace_session_link *sessions = &task->h->sessions;
-			struct uftrace_session *sess;
-
-			sess = find_task_session(sessions, task->t, rstack->time);
-			if (sess) {
-				for (i = 0; i < task->stack_count; i++) {
-					struct uftrace_trigger tr = {};
-
-					fstack = fstack_get(task, i);
-					if (fstack == NULL || fstack->addr == 0)
-						continue;
-
-					uftrace_match_filter(fstack->addr, &sess->filter_info, &tr);
-
-					if (tr.flags & TRIGGER_FL_FILTER) {
-						if (tr.fmode == FILTER_MODE_IN) {
-							task->filter.in_count++;
-							fstack->flags |= FSTACK_FL_FILTERED;
-						}
-						else {
-							task->filter.out_count++;
-							fstack->flags |= FSTACK_FL_NOTRACE |
-									 FSTACK_FL_NORECORD;
-						}
-					}
-					else if (fstack_get_filter_mode() == FILTER_MODE_IN &&
-						 task->filter.in_count == 0) {
-						fstack->flags |= FSTACK_FL_NORECORD;
-					}
-				}
-			}
-		}
+		if (task->func_stack)
+			apply_existing_fstack_filter(task, rstack);
 
 		task->filter.depth = task->h->depth;
 	}
